@@ -1,16 +1,12 @@
-# Use an official Node runtime as the base image
+# Railway-friendly OpenFront build (no BuildKit cache mounts).
 FROM node:24-slim AS base
 WORKDIR /usr/src/app
 
-# Build stage - install ALL dependencies and build
 FROM base AS build
 ENV HUSKY=0
-# Copy package files first for better caching
+ENV NODE_OPTIONS=--max-old-space-size=4096
 COPY package*.json ./
-RUN --mount=type=cache,id=s/a0a8b4e0-ce53-44c6-b5b8-ac7bcacfc2a8-/root/.npm,target=/root/.npm \
-    npm ci
-
-# Copy only what's needed for build
+RUN npm ci
 COPY tsconfig.json ./
 COPY vite.config.ts ./
 COPY eslint.config.js ./
@@ -20,29 +16,18 @@ COPY resources ./resources
 COPY proprietary ./proprietary
 COPY src ./src
 COPY zbin ./zbin
-# build-prod runs scripts/buildAssetHashes.ts after vite, to emit
-# static/asset-hashes.json and static/core-version.txt for the desktop
-# release descriptor. Without this the image build fails at that step with
-# ERR_MODULE_NOT_FOUND -- the unit suite cannot catch it, because only the
-# container build runs build-prod from a copied tree.
 COPY scripts ./scripts
-
 ARG GIT_COMMIT=unknown
 ENV GIT_COMMIT="$GIT_COMMIT"
 RUN npm run build-prod
 
-# Production dependencies stage - separate from build
 FROM base AS prod-deps
 ENV HUSKY=0
 ENV NPM_CONFIG_IGNORE_SCRIPTS=1
 COPY package*.json ./
-RUN --mount=type=cache,id=s/a0a8b4e0-ce53-44c6-b5b8-ac7bcacfc2a8-/root/.npm,target=/root/.npm \
-    npm ci --omit=dev
+RUN npm ci --omit=dev
 
-# Final production image
 FROM base
-
-# Install system dependencies
 RUN apt-get update && apt-get install -y \
     nginx \
     curl \
@@ -51,53 +36,40 @@ RUN apt-get update && apt-get install -y \
     apache2-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Update worker_connections in nginx.conf
 RUN sed -i 's/worker_connections [0-9]*/worker_connections 8192/' /etc/nginx/nginx.conf
 
-# Setup supervisor configuration
 RUN mkdir -p /var/log/supervisor
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-
-# Copy Nginx configuration
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 RUN rm -f /etc/nginx/sites-enabled/default
 
-# Script that generates the create-game worker upstream at container start.
 COPY generate-nginx-upstream.sh /usr/local/bin/generate-nginx-upstream.sh
 RUN chmod +x /usr/local/bin/generate-nginx-upstream.sh
 
-# Copy production node_modules from prod-deps stage (cached separately from build)
 COPY --from=prod-deps /usr/src/app/node_modules ./node_modules
 COPY package*.json ./
-
-# Copy built artifacts from build stage
 COPY --from=build /usr/src/app/static ./static
-
 COPY resources ./resources
-
-# Remove maps because they are not used by the server.
 RUN rm -rf ./resources/maps
 COPY tsconfig.json ./
 COPY client-api.json ./
 COPY src ./src
 COPY zbin ./zbin
 
-
 ARG GIT_COMMIT=unknown
 RUN echo "$GIT_COMMIT" > static/commit.txt
-
 ENV GIT_COMMIT="$GIT_COMMIT"
 
-RUN <<'EOF' tee /usr/local/bin/start.sh
-#!/bin/sh
-# Generate the create-game nginx upstream from NUM_WORKERS before nginx starts.
-/usr/local/bin/generate-nginx-upstream.sh
+RUN printf '%s\n' \
+  '#!/bin/sh' \
+  '/usr/local/bin/generate-nginx-upstream.sh' \
+  'if [ "$DOMAIN" = openfront.dev ] && [ "$SUBDOMAIN" != main ]; then' \
+  '  exec timeout 25h /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf' \
+  'else' \
+  '  exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf' \
+  'fi' \
+  > /usr/local/bin/start.sh \
+  && chmod +x /usr/local/bin/start.sh
 
-if [ "$DOMAIN" = openfront.dev ] && [ "$SUBDOMAIN" != main ]; then
-    exec timeout 25h /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf
-else
-    exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf
-fi
-EOF
-RUN chmod +x /usr/local/bin/start.sh
+EXPOSE 80
 ENTRYPOINT ["/usr/local/bin/start.sh"]

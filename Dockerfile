@@ -40,8 +40,11 @@ RUN sed -i 's/worker_connections [0-9]*/worker_connections 8192/' /etc/nginx/ngi
 
 RUN mkdir -p /var/log/supervisor
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-COPY nginx.conf /etc/nginx/conf.d/default.conf
-RUN rm -f /etc/nginx/sites-enabled/default
+# Debian nginx ships a default site that also claims default_server on :80
+RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default \
+ && rm -f /etc/nginx/conf.d/default.conf \
+ && printf 'server_names_hash_bucket_size 128;\n' > /etc/nginx/conf.d/00-defaults.conf
+COPY nginx.conf /etc/nginx/conf.d/openfront.conf
 
 COPY generate-nginx-upstream.sh /usr/local/bin/generate-nginx-upstream.sh
 RUN chmod +x /usr/local/bin/generate-nginx-upstream.sh
@@ -71,5 +74,12 @@ RUN printf '%s\n' \
   > /usr/local/bin/start.sh \
   && chmod +x /usr/local/bin/start.sh
 
+ENV GAME_ENV=dev
+ENV NUM_WORKERS=2
+ENV DOMAIN=localhost
+ENV GIT_COMMIT=selfhost
+ENV TURNSTILE_SITE_KEY=1x00000000000000000000AA
+ENV API_KEY=WARNING_DEV_API_KEY_DO_NOT_USE_IN_PRODUCTION
+ENV ADMIN_BOT_API_KEY=WARNING_DEV_ADMIN_BOT_KEY_DO_NOT_USE_IN_PRODUCTION
 EXPOSE 80
 ENTRYPOINT ["/usr/local/bin/start.sh"]
